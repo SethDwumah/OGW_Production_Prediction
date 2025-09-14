@@ -8,30 +8,54 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, r2_score
 import joblib
 import seaborn as sns
+import io
 
 # =========================
 # Streamlit Config
 # =========================
 st.set_page_config(page_title="OGW Prediction Dashboard", layout="wide")
+st.title("📈 OGW Prediction Dashboard")
 
 # =========================
-# Load Models
+# Cached Loaders (faster restarts & reruns)
 # =========================
-models = {
-    "Random Forest": joblib.load("rf_model.pkl"),
-    "XGBoost": joblib.load("xgb_model.pkl"),
-    "Extra Trees": joblib.load("extr_model.pkl"),
-}
+@st.cache_resource(show_spinner=False)
+def load_models():
+    return {
+        "Random Forest": joblib.load("rf_model.pkl"),
+        "XGBoost": joblib.load("xgb_model.pkl"),
+        "Extra Trees": joblib.load("extr_model.pkl"),
+    }
 
-# =========================
-# Load Preprocessor & Scaler
-# =========================
-preprocessor = joblib.load("preprocessor.pkl")
-y_scaler = joblib.load("y_scaler.pkl")
+@st.cache_resource(show_spinner=False)
+def load_preproc_and_scaler():
+    preprocessor = joblib.load("preprocessor.pkl")
+    y_scaler = joblib.load("y_scaler.pkl")
+    return preprocessor, y_scaler
+
+# Load once (cached)
+try:
+    models = load_models()
+    preprocessor, y_scaler = load_preproc_and_scaler()
+except Exception as e:
+    st.error(f"🔧 Failed to load models or transformers: {e}")
+    st.stop()
 
 # =========================
 # Helper Functions
 # =========================
+def validate_columns(df_input: pd.DataFrame, preproc):
+    """
+    Validate that the uploaded DataFrame has all columns expected by the preprocessor.
+    If the preprocessor exposes `feature_names_in_`, we can warn early.
+    """
+    expected = getattr(preproc, "feature_names_in_", None)
+    if expected is None:
+        # Can't pre-validate; rely on transform error handling
+        return True, []
+    missing = [c for c in expected if c not in df_input.columns]
+    return len(missing) == 0, missing
+
 def preprocess_and_predict(model, df_input):
     X_processed = preprocessor.transform(df_input)
     y_pred_scaled = model.predict(X_processed)
@@ -45,7 +69,7 @@ def prepare_plot_data(df_filtered, smooth=True):
 
     if smooth:
         date_diffs = df_filtered['PRODUCTION DATE'].diff().dropna().dt.days
-        avg_gap = date_diffs.mean()
+        avg_gap = date_diffs.mean() if not date_diffs.empty else 9999
 
         if avg_gap <= 2:
             df_filtered['Period'] = df_filtered['PRODUCTION DATE'].dt.to_period('M')
@@ -82,7 +106,8 @@ def plot_production_trends(df_filtered, smooth=True):
         xaxis_title="Date",
         yaxis_title="Production Rate",
         template="plotly_dark",
-        legend_title="Toggle Lines"
+        legend_title="Toggle Lines",
+        yaxis_tickformat=",.0f"
     )
     return fig
 
@@ -107,6 +132,7 @@ def visualize_data(df):
         elif plot_type == "Scatter":
             fig = px.scatter(df, x=col_x, y=col_y, title=f"{col_y} vs {col_x}")
 
+        fig.update_layout(yaxis_tickformat=",.0f")
         st.plotly_chart(fig, use_container_width=True)
 
     elif plot_type == "Correlation Heatmap":
@@ -117,11 +143,6 @@ def visualize_data(df):
         fig, ax = plt.subplots(figsize=(10, 6))
         sns.heatmap(numeric_df.corr(), annot=True, cmap="coolwarm", ax=ax)
         st.pyplot(fig)
-
-#def calculate_metrics(y_true, y_pred):
-    #rmse = np.sqrt(mean_squared_error(y_true, y_pred, multioutput='uniform_average'))
-    #r2 = r2_score(y_true, y_pred, multioutput='uniform_average')
-    #return rmse, r2
 
 def generate_operational_recommendations(df_sample, shap_values, feature_names, target_name):
     if hasattr(shap_values, "values"):  # Explanation object
@@ -155,43 +176,96 @@ model_choice = st.sidebar.selectbox("🤖 Select Model", options=list(models.key
 smooth_toggle = st.sidebar.radio("📊 Plot Style", ["Smoothed Trends", "Raw Data"])
 predict_button = st.sidebar.button("🚀 Predict")
 
+# Guardrail: show upload details & size hint
+if uploaded_file is not None:
+    size_mb = getattr(uploaded_file, "size", None)
+    if size_mb is not None:
+        size_mb = size_mb / (1024 * 1024)
+        st.sidebar.caption(f"File size: ~{size_mb:.2f} MB")
+        if size_mb > 25:
+            st.sidebar.warning("Large CSVs may be slow or memory-heavy on Streamlit Cloud.")
+
 # Persist uploaded data
 if uploaded_file:
-    st.session_state.df_raw = pd.read_csv(uploaded_file)
+    try:
+        # Read to memory buffer first to avoid partial reads
+        content = uploaded_file.read()
+        df_candidate = pd.read_csv(io.BytesIO(content))
+        st.session_state.df_raw = df_candidate
+    except Exception as e:
+        st.error(f"Could not read CSV: {e}")
+        st.session_state.pop("df_raw", None)
 else:
     st.session_state.pop("df_raw", None)
-    
+
 st.write("### 📈 Production Dashboard")
 tab1, tab2, tab3 = st.tabs(["📈 Predictions", "📊 Data Visualization", "🧠 SHAP Analysis"])
 
+# =========================
+# Prediction Flow
+# =========================
 if "df_raw" in st.session_state and predict_button:
     df = st.session_state.df_raw.copy()
-    df['PRODUCTION DATE'] = pd.to_datetime(df['PRODUCTION DATE'], errors='coerce')
-    df['year'] = df['PRODUCTION DATE'].dt.year
-    df['month'] = df['PRODUCTION DATE'].dt.month
-    df['day'] = df['PRODUCTION DATE'].dt.day
 
-    model = models[model_choice]
-    preds = preprocess_and_predict(model, df)
-    df['Predicted Oil'] = preds[:, 0]
-    df['Predicted Gas'] = preds[:, 1]
-    df['Predicted Water'] = preds[:, 2]
-    st.session_state.df_pred = df
+    if df.empty:
+        st.warning("Uploaded CSV is empty.")
+    else:
+        # Ensure PRODUCTION DATE exists for plotting (not strictly required for prediction)
+        if "PRODUCTION DATE" not in df.columns:
+            st.info("`PRODUCTION DATE` column not found. Plots will use raw ordering.")
+        else:
+            df['PRODUCTION DATE'] = pd.to_datetime(df['PRODUCTION DATE'], errors='coerce')
 
+        # Add simple date features if PRODUCTION DATE present
+        if "PRODUCTION DATE" in df.columns:
+            df['year'] = df['PRODUCTION DATE'].dt.year
+            df['month'] = df['PRODUCTION DATE'].dt.month
+            df['day'] = df['PRODUCTION DATE'].dt.day
+
+        # Column validation against preprocessor expectations (when available)
+        ok, missing = validate_columns(df, preprocessor)
+        if not ok:
+            st.error(
+                "Some required columns are missing for the model preprocessor:\n\n"
+                + ", ".join(missing)
+            )
+        else:
+            # Run prediction
+            try:
+                model = models[model_choice]
+                preds = preprocess_and_predict(model, df)
+                if preds.ndim != 2 or preds.shape[1] < 3:
+                    raise ValueError("Model did not return 3 outputs (Oil, Gas, Water).")
+
+                df['Predicted Oil'] = preds[:, 0]
+                df['Predicted Gas'] = preds[:, 1]
+                df['Predicted Water'] = preds[:, 2]
+                st.session_state.df_pred = df
+                st.success("✅ Predictions generated.")
+            except Exception as e:
+                st.error(f"Prediction failed: {e}")
+
+# =========================
+# Tabs
+# =========================
 if "df_pred" in st.session_state:
     df = st.session_state.df_pred
 
     # ===== TAB 1: Predictions =====
     with tab1:
-       
         col1, col2, col3 = st.columns(3)
+        try:
+            col1.metric("Oil Production", f"{df['Predicted Oil'].mean():,.0f} stb/day")
+            col2.metric("Gas Production", f"{(df['Predicted Gas'].mean())/1000:,.0f} mscf/day")
+            col3.metric("Water Production", f"{df['Predicted Water'].mean():,.0f} stb/day")
+        except Exception:
+            st.caption("Metrics unavailable due to missing predictions.")
 
-        col1.metric("Oil Production", f"{df['Predicted Oil'].mean():,.0f} stb/day")
-        col2.metric("Gas Production", f"{(df['Predicted Gas'].mean())/1000:,.0f} mscf/day")
-        col3.metric("Water Production", f"{df['Predicted Water'].mean():,.0f} stb/day")
-
-        fig = plot_production_trends(df, smooth=(smooth_toggle == "Smoothed Trends"))
-        st.plotly_chart(fig, use_container_width=True)
+        try:
+            fig = plot_production_trends(df, smooth=(smooth_toggle == "Smoothed Trends"))
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Plotting failed: {e}")
 
     # ===== TAB 2: Data Visualization =====
     with tab2:
@@ -200,40 +274,69 @@ if "df_pred" in st.session_state:
     # ===== TAB 3: SHAP Analysis =====
     with tab3:
         st.subheader(f"📊 SHAP Feature Importance for {model_choice}")
-        sample_size = min(200, len(df))
-        df_sample = df.sample(sample_size, random_state=42)
-        X_processed = preprocessor.transform(df_sample)
-        feature_names = preprocessor.get_feature_names_out()
+        try:
+            sample_size = max(1, min(200, len(df)))
+            df_sample = df.sample(sample_size, random_state=42)
 
-        def explain_single_model(single_model, target_name):
-            model_type = type(single_model).__name__.lower()
-            try:
-                if any(t in model_type for t in ["forest", "extra", "xgb"]):
-                    explainer = shap.TreeExplainer(single_model)
-                    shap_values = explainer.shap_values(X_processed)
-                else:
-                    explainer = shap.Explainer(single_model.predict, X_processed)
-                    shap_values = explainer(X_processed)
-                fig_shap = plt.figure()
-                shap.summary_plot(shap_values, X_processed, feature_names=feature_names, show=False)
-                st.pyplot(fig_shap)
-                recs = generate_operational_recommendations(
-                    df_sample,
-                    shap_values if not isinstance(shap_values, list) else shap_values[0],
-                    feature_names,
-                    target_name
-                )
-                for r in recs:
-                    st.write(f"- {r}")
-            except Exception as e:
-                st.error(f"SHAP failed for {target_name}: {e}")
+            # Use only model input columns for SHAP to avoid ColumnTransformer issues
+            expected = getattr(preprocessor, "feature_names_in_", None)
+            if expected is not None:
+                X_base = df_sample[expected].copy()
+            else:
+                # Best effort: pass full df_sample; preprocessor will select/transform
+                X_base = df_sample.copy()
 
-        if hasattr(models[model_choice], "estimators_"):
-            for i, target in enumerate(["Oil Production", "Gas Volume", "Water Production"]):
-                st.write(f"### SHAP Summary - {target}")
-                explain_single_model(models[model_choice].estimators_[i], target)
-        else:
-            explain_single_model(models[model_choice], "All Targets")
+            X_processed = preprocessor.transform(X_base)
+            feature_names = preprocessor.get_feature_names_out()
+
+            def explain_single_model(single_model, target_name):
+                model_type = type(single_model).__name__.lower()
+                try:
+                    # Tree-based fast path
+                    if any(t in model_type for t in ["forest", "extra", "xgb", "gradientboost", "decisiontree"]):
+                        explainer = shap.TreeExplainer(single_model)
+                        shap_values = explainer.shap_values(X_processed)
+                    else:
+                        explainer = shap.Explainer(single_model.predict, X_processed)
+                        shap_values = explainer(X_processed)
+
+                    # SHAP summary
+                    fig_shap = plt.figure()
+                    shap.summary_plot(
+                        shap_values if not isinstance(shap_values, list) else shap_values[0],
+                        X_processed,
+                        feature_names=feature_names,
+                        show=False
+                    )
+                    st.pyplot(fig_shap)
+
+                    # Simple recs
+                    recs = generate_operational_recommendations(
+                        df_sample,
+                        shap_values if not isinstance(shap_values, list) else shap_values[0],
+                        feature_names,
+                        target_name
+                    )
+                    st.write("**Operational hints (auto-generated)**")
+                    for r in recs:
+                        st.write(f"- {r}")
+                except Exception as e:
+                    st.info("SHAP could not be computed for this model/target on the current environment.")
+                    st.error(f"Details: {e}")
+
+            # MultiOutput-style models (e.g., MultiOutputRegressor)
+            if hasattr(models[model_choice], "estimators_"):
+                for i, target in enumerate(["Oil Production", "Gas Volume", "Water Production"]):
+                    st.write(f"### SHAP Summary - {target}")
+                    try:
+                        explain_single_model(models[model_choice].estimators_[i], target)
+                    except Exception as e:
+                        st.error(f"SHAP failed for {target}: {e}")
+            else:
+                explain_single_model(models[model_choice], "All Targets")
+
+        except Exception as e:
+            st.error(f"SHAP setup failed: {e}")
 
 elif uploaded_file and not predict_button:
     st.info("Click the 🚀 Predict button to generate predictions.")
