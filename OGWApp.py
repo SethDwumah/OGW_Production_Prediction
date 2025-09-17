@@ -22,9 +22,9 @@ st.title("📈 OGW Prediction Dashboard")
 @st.cache_resource(show_spinner=False)
 def load_models():
     return {
-        "Random Forest": joblib.load("rf_model.pkl"),
+       # "Random Forest": joblib.load("rf_model.pkl"),
         "XGBoost": joblib.load("xgb_model.pkl"),
-        "Extra Trees": joblib.load("extr_model.pkl"),
+        #"Extra Trees": joblib.load("extr_model.pkl"),
     }
 
 @st.cache_resource(show_spinner=False)
@@ -342,3 +342,4 @@ elif uploaded_file and not predict_button:
     st.info("Click the 🚀 Predict button to generate predictions.")
 else:
     st.warning("Please upload a CSV file to proceed.")
+
