@@ -21,10 +21,11 @@ st.title("📈 OGW Prediction Dashboard")
 # =========================
 @st.cache_resource(show_spinner=False)
 def load_models():
+    # Add back other models later if needed
     return {
-       # "Random Forest": joblib.load("rf_model.pkl"),
         "XGBoost": joblib.load("xgb_model.pkl"),
-        #"Extra Trees": joblib.load("extr_model.pkl"),
+        # "Random Forest": joblib.load("rf_model.pkl"),
+        # "Extra Trees": joblib.load("extr_model.pkl"),
     }
 
 @st.cache_resource(show_spinner=False)
@@ -45,13 +46,9 @@ except Exception as e:
 # Helper Functions
 # =========================
 def validate_columns(df_input: pd.DataFrame, preproc):
-    """
-    Validate that the uploaded DataFrame has all columns expected by the preprocessor.
-    If the preprocessor exposes `feature_names_in_`, we can warn early.
-    """
+    """Validate that the uploaded DataFrame has all columns expected by the preprocessor."""
     expected = getattr(preproc, "feature_names_in_", None)
     if expected is None:
-        # Can't pre-validate; rely on transform error handling
         return True, []
     missing = [c for c in expected if c not in df_input.columns]
     return len(missing) == 0, missing
@@ -272,112 +269,114 @@ if "df_pred" in st.session_state:
         visualize_data(df)
 
     # ===== TAB 3: SHAP Analysis =====
-    # ===== TAB 3: SHAP Analysis =====
-with tab3:
-    st.subheader(f"📊 SHAP Feature Importance for {model_choice}")
-    try:
-        sample_size = max(1, min(200, len(df)))
-        df_sample = df.sample(sample_size, random_state=42)
+    with tab3:
+        st.subheader(f"📊 SHAP Feature Importance for {model_choice}")
+        try:
+            sample_size = max(1, min(200, len(df)))
+            df_sample = df.sample(sample_size, random_state=42)
 
-        # Use only model input columns for SHAP to avoid ColumnTransformer issues
-        expected = getattr(preprocessor, "feature_names_in_", None)
-        if expected is not None:
-            X_base = df_sample[expected].copy()
-        else:
-            X_base = df_sample.copy()
-
-        X_processed = preprocessor.transform(X_base)
-        feature_names = preprocessor.get_feature_names_out()
-        target_names = ["Oil Production", "Gas Volume", "Water Production"]
-
-        def _plot_shap_summary(shap_vals, X_proc, feat_names, title):
-            st.write(f"### {title}")
-            fig_shap = plt.figure()
-            shap.summary_plot(
-                shap_vals if not isinstance(shap_vals, list) else shap_vals[0],
-                X_proc,
-                feature_names=feat_names,
-                show=False
-            )
-            st.pyplot(fig_shap)
-
-        def _op_hints(vals, feats, tgt):
-            recs = generate_operational_recommendations(df_sample, vals if not hasattr(vals, "values") else vals.values, feats, tgt)
-            st.write("**Operational hints (auto-generated)**")
-            for r in recs:
-                st.write(f"- {r}")
-
-        model = models[model_choice]
-        model_type = type(model).__name__.lower()
-        is_xgb = "xgb" in model_type or "xgboost" in str(type(model)).lower()
-
-        # ------------ XGBoost-specific handling ------------
-        if is_xgb:
-            # Case 1: MultiOutputRegressor(XGBRegressor) — explain per target
-            if hasattr(model, "estimators_") and len(getattr(model, "estimators_", [])) >= 1:
-                for i, tgt in enumerate(target_names[:len(model.estimators_)]):
-                    try:
-                        base = model.estimators_[i]  # XGBRegressor
-                        explainer = shap.TreeExplainer(base)
-                        shap_vals = explainer.shap_values(X_processed)
-
-                        _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – XGBoost – {tgt}")
-                        _op_hints(shap_vals, feature_names, tgt)
-                    except Exception as e:
-                        st.error(f"SHAP failed for XGBoost ({tgt}): {e}")
-
-            # Case 2: plain XGBRegressor (single-output) — explain once
+            # Use only model input columns for SHAP to avoid ColumnTransformer issues
+            expected = getattr(preprocessor, "feature_names_in_", None)
+            if expected is not None:
+                X_base = df_sample[expected].copy()
             else:
-                try:
-                    explainer = shap.TreeExplainer(model)
-                    shap_vals = explainer.shap_values(X_processed)
-                    _plot_shap_summary(shap_vals, X_processed, feature_names, "SHAP Summary – XGBoost")
-                    _op_hints(shap_vals, feature_names, "All Targets")
-                except Exception as e:
-                    st.error(f"SHAP failed for XGBoost: {e}")
+                X_base = df_sample.copy()
 
-        # ------------ Other tree models (RF/ET/GB/DT) ------------
-        elif any(t in model_type for t in ["forest", "extra", "gradientboost", "decisiontree"]):
-            try:
-                explainer = shap.TreeExplainer(model)
-                shap_vals = explainer.shap_values(X_processed)
-                if not isinstance(shap_vals, list):
-                    shap_vals = [shap_vals]
-                for i, tgt in enumerate(target_names[:len(shap_vals)]):
-                    _plot_shap_summary(shap_vals[i], X_processed, feature_names, f"SHAP Summary – {type(model).__name__} – {tgt}")
-                    _op_hints(shap_vals[i], feature_names, tgt)
-            except Exception:
-                # Fallback for wrappers exposing per-target estimators
+            X_processed = preprocessor.transform(X_base)
+            feature_names = preprocessor.get_feature_names_out()
+            target_names = ["Oil Production", "Gas Volume", "Water Production"]
+
+            def _plot_shap_summary(shap_vals, X_proc, feat_names, title):
+                st.write(f"### {title}")
+                fig_shap = plt.figure()
+                shap.summary_plot(
+                    shap_vals if not isinstance(shap_vals, list) else shap_vals[0],
+                    X_proc,
+                    feature_names=feat_names,
+                    show=False
+                )
+                st.pyplot(fig_shap)
+
+            def _op_hints(vals, feats, tgt):
+                recs = generate_operational_recommendations(
+                    df_sample,
+                    vals if not hasattr(vals, "values") else vals.values,
+                    feats,
+                    tgt
+                )
+                st.write("**Operational hints (auto-generated)**")
+                for r in recs:
+                    st.write(f"- {r}")
+
+            model = models[model_choice]
+            model_type = type(model).__name__.lower()
+            is_xgb = "xgb" in model_type or "xgboost" in str(type(model)).lower()
+
+            # ------------ XGBoost-specific handling ------------
+            if is_xgb:
+                # Case 1: MultiOutputRegressor(XGBRegressor) — explain per target
                 if hasattr(model, "estimators_") and len(getattr(model, "estimators_", [])) >= 1:
                     for i, tgt in enumerate(target_names[:len(model.estimators_)]):
                         try:
-                            base = model.estimators_[i]
+                            base = model.estimators_[i]  # XGBRegressor
                             explainer = shap.TreeExplainer(base)
                             shap_vals = explainer.shap_values(X_processed)
-                            _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – {type(base).__name__} – {tgt}")
+
+                            _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – XGBoost – {tgt}")
                             _op_hints(shap_vals, feature_names, tgt)
                         except Exception as e:
-                            st.error(f"SHAP failed for {type(base).__name__} ({tgt}): {e}")
+                            st.error(f"SHAP failed for XGBoost ({tgt}): {e}")
+
+                # Case 2: plain XGBRegressor (single-output) — explain once
                 else:
-                    st.info("SHAP fallback not available for this model structure.")
+                    try:
+                        explainer = shap.TreeExplainer(model)
+                        shap_vals = explainer.shap_values(X_processed)
+                        _plot_shap_summary(shap_vals, X_processed, feature_names, "SHAP Summary – XGBoost")
+                        _op_hints(shap_vals, feature_names, "All Targets")
+                    except Exception as e:
+                        st.error(f"SHAP failed for XGBoost: {e}")
 
-        # ------------ Generic non-tree fallback ------------
-        else:
-            try:
-                explainer = shap.Explainer(model.predict, X_processed)
-                shap_vals = explainer(X_processed)
-                _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – {type(model).__name__}")
-                _op_hints(shap_vals, feature_names, "All Targets")
-            except Exception as e:
-                st.info("SHAP could not be computed for this model on the current environment.")
-                st.error(f"Details: {e}")
+            # ------------ Other tree models (RF/ET/GB/DT) ------------
+            elif any(t in model_type for t in ["forest", "extra", "gradientboost", "decisiontree"]):
+                try:
+                    explainer = shap.TreeExplainer(model)
+                    shap_vals = explainer.shap_values(X_processed)
+                    if not isinstance(shap_vals, list):
+                        shap_vals = [shap_vals]
+                    for i, tgt in enumerate(target_names[:len(shap_vals)]):
+                        _plot_shap_summary(shap_vals[i], X_processed, feature_names, f"SHAP Summary – {type(model).__name__} – {tgt}")
+                        _op_hints(shap_vals[i], feature_names, tgt)
+                except Exception:
+                    # Fallback for wrappers exposing per-target estimators
+                    if hasattr(model, "estimators_") and len(getattr(model, "estimators_", [])) >= 1:
+                        for i, tgt in enumerate(target_names[:len(model.estimators_)]):
+                            try:
+                                base = model.estimators_[i]
+                                explainer = shap.TreeExplainer(base)
+                                shap_vals = explainer.shap_values(X_processed)
+                                _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – {type(base).__name__} – {tgt}")
+                                _op_hints(shap_vals, feature_names, tgt)
+                            except Exception as e:
+                                st.error(f"SHAP failed for {type(base).__name__} ({tgt}): {e}")
+                    else:
+                        st.info("SHAP fallback not available for this model structure.")
 
-    except Exception as e:
-        st.error(f"SHAP setup failed: {e}")
+            # ------------ Generic non-tree fallback ------------
+            else:
+                try:
+                    explainer = shap.Explainer(model.predict, X_processed)
+                    shap_vals = explainer(X_processed)
+                    _plot_shap_summary(shap_vals, X_processed, feature_names, f"SHAP Summary – {type(model).__name__}")
+                    _op_hints(shap_vals, feature_names, "All Targets")
+                except Exception as e:
+                    st.info("SHAP could not be computed for this model on the current environment.")
+                    st.error(f"Details: {e}")
+
+        except Exception as e:
+            st.error(f"SHAP setup failed: {e}")
 
 elif uploaded_file and not predict_button:
     st.info("Click the 🚀 Predict button to generate predictions.")
 else:
     st.warning("Please upload a CSV file to proceed.")
-
-
